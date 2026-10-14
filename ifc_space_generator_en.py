@@ -3,8 +3,8 @@
 """
 IFC Space Generator
 ===================
-Creates IfcSpace objects (with room numbers) for all fully enclosed rooms of an
-IFC file, without requiring any rooms in the source model.
+Creates IfcSpace objects (with room number and room name) for all fully
+enclosed rooms of an IFC file, without requiring any rooms in the source model.
 Developed for Archicad 27 exports (IFC2X3), also works with IFC4.
 
 How it works
@@ -17,8 +17,18 @@ How it works
    little of its footprint (slab opening) and the footprint on the storey above
    is (almost) identical, both are joined into ONE IfcSpace.
 4. Write the IfcSpaces as an extrusion of the footprint, assign them to the
-   storey, and store the room number in Name + LongName +
-   Pset_SpaceCommon.Reference.
+   storey, and store the room number in Name, the room name in LongName and the
+   number additionally in Pset_SpaceCommon.Reference.
+
+Two ways to work
+----------------
+* "Generate spaces (automatic)": analysis + export in one go, numbers are
+  generated automatically (room name = room number).
+* "Analyze and edit rooms": analysis first, then an interactive room editor
+  opens. Per storey you see the floor plan with all detected rooms, click a
+  room (or a table row) and enter room number and room name in a dialog.
+  Rooms can be excluded from the export. The work can be saved as a session
+  file (JSON) and continued later without re-running the analysis.
 
 Dependencies
 ------------
@@ -33,19 +43,22 @@ Dependencies
 Usage
 -----
     python ifc_space_generator.py                  # GUI
-    python ifc_space_generator.py model.ifc        # no GUI (CLI)
+    python ifc_space_generator.py model.ifc        # no GUI (CLI, automatic numbering)
     python ifc_space_generator.py -h               # all options
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import queue
+import re
 import statistics
 import sys
 import time
 import traceback
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import asdict, dataclass, field
 
 import numpy as np
 import shapely
@@ -66,6 +79,8 @@ BARRIER_CLASSES = ("IfcWall", "IfcWallStandardCase", "IfcColumn",
                    "IfcCurtainWall", "IfcMember", "IfcPlate")
 FILL_CLASSES = ("IfcDoor", "IfcWindow")      # close openings
 SLAB_CLASSES = ("IfcSlab", "IfcRoof")        # used to detect slab openings
+
+SESSION_VERSION = 1
 
 
 @dataclass
@@ -112,6 +127,71 @@ class Reporter:
     def check(self):
         if self._c and self._c():
             raise Cancelled()
+
+
+# --------------------------------------------------------------------------
+# Data model shared by analysis, editor, session files and export
+# --------------------------------------------------------------------------
+@dataclass
+class RoomData:
+    uid: int
+    base: int                # index of the storey where the space starts
+    top: int                 # index of the last storey the space spans
+    polys: dict              # storey index -> shapely Polygon (footprint on that storey)
+    height: float            # extrusion height in m
+    number: str
+    name: str
+    include: bool = True     # exported or not
+    edited: bool = False     # touched by the user in the editor
+
+
+@dataclass
+class StoreyData:
+    step_id: int             # STEP id of the IfcBuildingStorey in the source file
+    name: str
+    elev: float              # meters
+    barrier: object = None   # shapely geometry of the wall section (display only)
+
+
+@dataclass
+class Analysis:
+    src: str
+    schema: str
+    storeys: list = field(default_factory=list)
+    rooms: list = field(default_factory=list)
+
+
+def natural_key(text):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", text)]
+
+
+def session_to_dict(a: Analysis, params: dict) -> dict:
+    def hx(g):
+        return None if g is None else shapely.to_wkb(g, hex=True)
+    return {
+        "version": SESSION_VERSION,
+        "src": a.src,
+        "schema": a.schema,
+        "params": params,
+        "storeys": [{"id": s.step_id, "name": s.name, "elev": s.elev, "barrier": hx(s.barrier)}
+                    for s in a.storeys],
+        "rooms": [{"uid": r.uid, "base": r.base, "top": r.top, "height": r.height,
+                   "number": r.number, "name": r.name, "include": r.include, "edited": r.edited,
+                   "polys": {str(k): hx(g) for k, g in r.polys.items()}} for r in a.rooms],
+    }
+
+
+def session_from_dict(d: dict):
+    if d.get("version") != SESSION_VERSION:
+        raise ValueError("Unsupported session file version.")
+
+    def fx(h):
+        return None if h is None else shapely.from_wkb(h)
+    storeys = [StoreyData(s["id"], s["name"], s["elev"], fx(s["barrier"])) for s in d["storeys"]]
+    rooms = [RoomData(r["uid"], r["base"], r["top"], {int(k): fx(h) for k, h in r["polys"].items()},
+                      r["height"], r["number"], r["name"], r["include"], r["edited"])
+             for r in d["rooms"]]
+    return Analysis(d["src"], d["schema"], storeys, rooms), d.get("params", {})
 
 
 # --------------------------------------------------------------------------
@@ -263,13 +343,17 @@ class Storey:
     elev: float      # meters
 
 
+def _storey_name(ent):
+    return ent.Name or ent.LongName or f"#{ent.id()}"
+
+
 def read_storeys(model, scale, rep):
     storeys = []
     for st in model.by_type("IfcBuildingStorey"):
         if st.ObjectPlacement is None:
             continue
         M = np.array(ifcopenshell.util.placement.get_local_placement(st.ObjectPlacement), dtype=float)
-        storeys.append(Storey(st, st.Name or st.LongName or f"#{st.id()}", M, M[2, 3] * scale))
+        storeys.append(Storey(st, _storey_name(st), M, M[2, 3] * scale))
     if not storeys:
         raise ValueError("The IFC contains no IfcBuildingStorey with a placement.")
     zs = {round(s.elev, 3) for s in storeys}
@@ -355,7 +439,7 @@ def _polyline(model, pts):
         model.create_entity("IfcCartesianPoint", Coordinates=p) for p in pts])
 
 
-def add_space(model, ctx, oh, storey, Minv, scale, poly, z0_m, height_m, number):
+def add_space(model, ctx, oh, storey, Minv, scale, poly, z0_m, height_m, number, name):
     z0_file = z0_m / scale
     poly = orient(poly, 1.0)
     outer = _polyline(model, _local_ring(poly.exterior.coords, Minv, z0_file, scale))
@@ -384,7 +468,7 @@ def add_space(model, ctx, oh, storey, Minv, scale, poly, z0_m, height_m, number)
             "IfcAxis2Placement3D",
             Location=model.create_entity("IfcCartesianPoint", Coordinates=(0.0, 0.0, 0.0))))
 
-    kw = dict(GlobalId=ifcopenshell.guid.new(), OwnerHistory=oh, Name=number, LongName=number,
+    kw = dict(GlobalId=ifcopenshell.guid.new(), OwnerHistory=oh, Name=number, LongName=name,
               ObjectPlacement=placement, Representation=pds, CompositionType="ELEMENT")
     if model.schema == "IFC2X3":
         kw["InteriorOrExteriorSpace"] = "INTERNAL"
@@ -406,20 +490,17 @@ def add_space(model, ctx, oh, storey, Minv, scale, poly, z0_m, height_m, number)
 
 
 # --------------------------------------------------------------------------
-# Main workflow
+# Workflow: analysis
 # --------------------------------------------------------------------------
 @dataclass
 class Chain:
     base: int
     top: int
-    base_poly: Polygon
-    last_poly: Polygon
+    polys: dict      # storey index -> Polygon
 
 
-def generate_spaces(p: Params, rep: Reporter) -> dict:
-    t0 = time.time()
-    if os.path.abspath(p.src) == os.path.abspath(p.dst):
-        raise ValueError("The output file must not be the input file.")
+def _analyze_model(p: Params, rep: Reporter):
+    """Detect rooms. Returns (Analysis, open ifcopenshell model)."""
     try:
         p.number_format.format(g=1, s="X", n=1)
     except Exception as e:
@@ -447,6 +528,7 @@ def generate_spaces(p: Params, rep: Reporter) -> dict:
         raise ValueError("No wall/column geometry found.")
 
     tol = max(p.gap_mm / 2000.0, 0.0005)
+    storey_data = [StoreyData(s.ent.id(), s.name, s.elev, None) for s in storeys]
 
     # ---- Analyze storeys
     rooms_by_storey = []
@@ -455,6 +537,8 @@ def generate_spaces(p: Params, rep: Reporter) -> dict:
         rep.status(f"Analyzing storey {k + 1}/{n}: {st.name} ...")
         barrier = build_barrier(barrier_items, st.elev + p.cut_height, tol)
         rooms = extract_rooms(barrier, tol, p.min_area) if barrier is not None else []
+        if barrier is not None:
+            storey_data[k].barrier = barrier.simplify(0.01)     # for the editor background
         rooms_by_storey.append(rooms)
         rep.log(f"  {st.name}: {len(rooms)} enclosed rooms")
         rep.progress(65 + 25 * (k + 1) / n)
@@ -471,7 +555,7 @@ def generate_spaces(p: Params, rep: Reporter) -> dict:
                 rep.log(f"  No slab geometry at {storeys[k].name} - not joining downwards.")
             else:
                 for ch in active:
-                    last = ch.last_poly
+                    last = ch.polys[ch.top]
                     if last.intersection(fp).area / last.area >= p.slab_open_ratio:
                         continue                      # closed slab -> separate room
                     best_iou, best_j = 0.0, None
@@ -483,12 +567,13 @@ def generate_spaces(p: Params, rep: Reporter) -> dict:
                         if iou > best_iou:
                             best_iou, best_j = iou, j
                     if best_j is not None and best_iou >= p.iou_min:
-                        ch.top, ch.last_poly = k, rooms[best_j]
+                        ch.top = k
+                        ch.polys[k] = rooms[best_j]
                         used.add(best_j)
                         nxt.append(ch)
         for j, r in enumerate(rooms):
             if j not in used:
-                ch = Chain(k, k, r, r)
+                ch = Chain(k, k, {k: r})
                 chains.append(ch)
                 nxt.append(ch)
         active = nxt
@@ -503,29 +588,81 @@ def generate_spaces(p: Params, rep: Reporter) -> dict:
     if not 2.0 <= last_h <= 6.0:
         last_h = statistics.median(heights) if heights else 3.0
 
-    # ---- Write
-    rep.status("Writing IfcSpaces ...")
-    oh = model.by_type("IfcOwnerHistory")[0] if model.by_type("IfcOwnerHistory") else None
-    ctx = _body_context(model)
-    per_storey_spaces = {}
-    per_storey_count = {}
+    # ---- Default numbering (room name = room number until the user edits it)
+    rooms_out = []
+    uid = 0
     for k, st in enumerate(storeys):
-        rep.check()
         group = [c for c in chains if c.base == k]
-        group.sort(key=lambda c: (-round(c.base_poly.centroid.y, 1), c.base_poly.centroid.x))
-        Minv = np.linalg.inv(st.M)
+        group.sort(key=lambda c: (-round(c.polys[k].centroid.y, 1), c.polys[k].centroid.x))
         for nr, ch in enumerate(group, start=1):
             number = p.number_format.format(g=p.first_storey_no + k, s=st.name, n=nr)
             z_top = storeys[ch.top + 1].elev if ch.top + 1 < n else storeys[ch.top].elev + last_h
             height = max(z_top - st.elev - p.ceiling_deduction, 0.5)
-            sp = add_space(model, ctx, oh, st.ent, Minv, scale, ch.base_poly, st.elev, height, number)
-            per_storey_spaces.setdefault(k, []).append(sp)
-        per_storey_count[st.name] = len(group)
-        rep.progress(90 + 8 * (k + 1) / n)
+            rooms_out.append(RoomData(uid, k, ch.top, ch.polys, height, number, number))
+            uid += 1
+
+    return Analysis(p.src, model.schema, storey_data, rooms_out), model
+
+
+def analyze(p: Params, rep: Reporter) -> Analysis:
+    analysis, _model = _analyze_model(p, rep)
+    rep.log(f"Analysis finished: {len(analysis.rooms)} rooms.")
+    return analysis
+
+
+# --------------------------------------------------------------------------
+# Workflow: export
+# --------------------------------------------------------------------------
+def write_ifc(analysis: Analysis, dst: str, rep: Reporter, model=None,
+              lo: float = 0.0, hi: float = 100.0) -> dict:
+    """Write all included rooms of an analysis as IfcSpaces into a copy of the source IFC."""
+    t0 = time.time()
+    if os.path.abspath(analysis.src) == os.path.abspath(dst):
+        raise ValueError("The output file must not be the input file.")
+    if model is None:
+        rep.status("Loading IFC file ... (this can take a moment for large files)")
+        rep.progress(None)
+        model = ifcopenshell.open(analysis.src)
+    scale = ifcopenshell.util.unit.calculate_unit_scale(model)
+
+    ents, minvs = [], []
+    for sd in analysis.storeys:
+        try:
+            ent = model.by_id(sd.step_id)
+        except Exception:
+            ent = None
+        if ent is None or not ent.is_a("IfcBuildingStorey") or _storey_name(ent) != sd.name:
+            raise ValueError(f"Storey '{sd.name}' (#{sd.step_id}) does not match the IFC file. "
+                             f"Was the file changed since the analysis/session was created?")
+        M = np.array(ifcopenshell.util.placement.get_local_placement(ent.ObjectPlacement), dtype=float)
+        ents.append(ent)
+        minvs.append(np.linalg.inv(M))
+
+    oh = model.by_type("IfcOwnerHistory")[0] if model.by_type("IfcOwnerHistory") else None
+    ctx = _body_context(model)
+
+    rooms = [r for r in analysis.rooms if r.include]
+    dups = sorted([num for num, c in Counter(r.number for r in rooms).items() if c > 1], key=natural_key)
+    if dups:
+        rep.log("WARNING: duplicate room numbers: " + ", ".join(dups))
+
+    rep.status("Writing IfcSpaces ...")
+    per_storey_spaces, per_storey_count = {}, {}
+    total = len(rooms)
+    for i, r in enumerate(rooms):
+        rep.check()
+        sd = analysis.storeys[r.base]
+        sp = add_space(model, ctx, oh, ents[r.base], minvs[r.base], scale, r.polys[r.base],
+                       sd.elev, r.height, r.number, r.name)
+        per_storey_spaces.setdefault(r.base, []).append(sp)
+        per_storey_count[sd.name] = per_storey_count.get(sd.name, 0) + 1
+        if i % 20 == 0:
+            rep.progress(lo + (hi - lo) * 0.9 * i / max(total, 1))
+            rep.status(f"Writing IfcSpaces ... {i}/{total}")
 
     for k, spaces in per_storey_spaces.items():
-        st = storeys[k].ent
-        rel = next((r for r in (st.IsDecomposedBy or ()) if r.is_a("IfcRelAggregates")), None)
+        st = ents[k]
+        rel = next((x for x in (st.IsDecomposedBy or ()) if x.is_a("IfcRelAggregates")), None)
         if rel is not None:
             rel.RelatedObjects = tuple(rel.RelatedObjects) + tuple(spaces)
         else:
@@ -534,47 +671,598 @@ def generate_spaces(p: Params, rep: Reporter) -> dict:
 
     rep.status("Saving IFC file ...")
     rep.progress(None)
-    model.write(p.dst)
+    model.write(dst)
     dt = time.time() - t0
-    rep.progress(100)
+    rep.progress(hi)
     rep.status("Done.")
-    rep.log(f"Saved: {p.dst} ({dt:.0f} s)")
-    return {"spaces": len(chains), "multi": len(multi), "per_storey": per_storey_count,
-            "dst": p.dst, "seconds": dt}
+    rep.log(f"Saved: {dst} ({dt:.0f} s)")
+    return {"spaces": len(rooms), "multi": sum(1 for r in rooms if r.top > r.base),
+            "per_storey": per_storey_count, "dst": dst, "seconds": dt}
+
+
+def generate_spaces(p: Params, rep: Reporter) -> dict:
+    """Automatic mode: analysis + export in one go."""
+    t0 = time.time()
+    if os.path.abspath(p.src) == os.path.abspath(p.dst):
+        raise ValueError("The output file must not be the input file.")
+    analysis, model = _analyze_model(p, rep)
+    res = write_ifc(analysis, p.dst, rep, model=model, lo=90.0, hi=100.0)
+    res["seconds"] = time.time() - t0
+    return res
 
 
 # --------------------------------------------------------------------------
 # Subprocess entry point (keeps the GUI responsive during long computations)
 # --------------------------------------------------------------------------
-def _worker_main(params, q):
+def _worker_main(mode, params, analysis, q):
     rep = Reporter(on_progress=lambda v: q.put(("progress", v)),
                    on_status=lambda s: q.put(("status", s)),
                    on_log=lambda s: q.put(("log", s)))
     try:
-        q.put(("done", generate_spaces(params, rep)))
+        if mode == "generate":
+            res = generate_spaces(params, rep)
+        elif mode == "analyze":
+            res = analyze(params, rep)
+        elif mode == "export":
+            res = write_ifc(analysis, params.dst, rep)
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+        q.put(("done", res))
     except Exception:
         q.put(("error", traceback.format_exc()))
 
 
 # --------------------------------------------------------------------------
-# GUI (PySide6)
+# GUI: room editor (PySide6 classes are created lazily so the CLI works without Qt)
+# --------------------------------------------------------------------------
+def _make_editor_class(QtCore, QtGui, QtWidgets):
+    Qt = QtCore.Qt
+
+    def geom_to_path(g):
+        """shapely geometry -> QPainterPath (y is flipped so that north points up)."""
+        path = QtGui.QPainterPath()
+        path.setFillRule(Qt.FillRule.OddEvenFill)
+        for poly in _polys(g):
+            for ring in [poly.exterior, *poly.interiors]:
+                pts = [QtCore.QPointF(c[0], -c[1]) for c in ring.coords]
+                path.addPolygon(QtGui.QPolygonF(pts))
+                path.closeSubpath()
+        return path
+
+    class PlanView(QtWidgets.QGraphicsView):
+        """Zoom with the mouse wheel, pan with the middle or right mouse button."""
+
+        def __init__(self, scene):
+            super().__init__(scene)
+            self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+            self.setTransformationAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+            self.setResizeAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorViewCenter)
+            self.setBackgroundBrush(QtGui.QBrush(QtGui.QColor(245, 245, 245)))
+            self._pan = None
+
+        def wheelEvent(self, e):
+            f = 1.0015 ** e.angleDelta().y()
+            self.scale(f, f)
+
+        def mousePressEvent(self, e):
+            if e.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.RightButton):
+                self._pan = e.position().toPoint()
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                e.accept()
+                return
+            super().mousePressEvent(e)
+
+        def mouseMoveEvent(self, e):
+            if self._pan is not None:
+                pos = e.position().toPoint()
+                d = pos - self._pan
+                self._pan = pos
+                self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - d.x())
+                self.verticalScrollBar().setValue(self.verticalScrollBar().value() - d.y())
+                e.accept()
+                return
+            super().mouseMoveEvent(e)
+
+        def mouseReleaseEvent(self, e):
+            if self._pan is not None and e.button() in (Qt.MouseButton.MiddleButton,
+                                                        Qt.MouseButton.RightButton):
+                self._pan = None
+                self.unsetCursor()
+                e.accept()
+                return
+            super().mouseReleaseEvent(e)
+
+        def contextMenuEvent(self, e):
+            e.accept()      # right button is used for panning
+
+    class RoomItem(QtWidgets.QGraphicsPathItem):
+        """Clickable room polygon in the floor plan."""
+
+        def __init__(self, editor, room, k):
+            super().__init__(geom_to_path(room.polys[k]))
+            self.editor, self.room, self.k = editor, room, k
+            self.selected = False
+            self.hover = False
+            self.setAcceptHoverEvents(True)
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.restyle()
+
+        def restyle(self):
+            r = self.room
+            if self.selected:
+                col, pen_col, w = QtGui.QColor(255, 160, 0, 170), QtGui.QColor(210, 90, 0), 3.0
+            elif not r.include:
+                col, pen_col, w = QtGui.QColor(140, 140, 140, 80), QtGui.QColor(120, 120, 120), 1.5
+            elif r.edited:
+                col, pen_col, w = QtGui.QColor(70, 175, 95, 120), QtGui.QColor(30, 120, 60), 1.5
+            else:
+                col, pen_col, w = QtGui.QColor(70, 130, 220, 100), QtGui.QColor(30, 80, 170), 1.5
+            if self.hover and not self.selected:
+                col.setAlpha(min(255, col.alpha() + 70))
+            if self.k != r.base:                      # continuation of a room from a lower storey
+                col.setAlpha(200)
+            brush = QtGui.QBrush(col)
+            if self.k != r.base:
+                brush.setStyle(Qt.BrushStyle.BDiagPattern)
+            pen = QtGui.QPen(pen_col)
+            pen.setWidthF(w)
+            pen.setCosmetic(True)
+            if not r.include:
+                pen.setStyle(Qt.PenStyle.DashLine)
+            self.setBrush(brush)
+            self.setPen(pen)
+            self.setZValue(5 if self.selected else 1)
+
+        def set_selected(self, value):
+            self.selected = value
+            self.restyle()
+
+        def hoverEnterEvent(self, e):
+            self.hover = True
+            self.restyle()
+
+        def hoverLeaveEvent(self, e):
+            self.hover = False
+            self.restyle()
+
+        def mousePressEvent(self, e):
+            if e.button() == Qt.MouseButton.LeftButton:
+                self.editor.select_room(self.room.uid)
+                e.accept()
+            else:
+                e.ignore()
+
+        def mouseDoubleClickEvent(self, e):
+            if e.button() == Qt.MouseButton.LeftButton:
+                self.editor.edit_room(self.room.uid)
+                e.accept()
+
+    class RoomDialog(QtWidgets.QDialog):
+        """Input window for the data of one room."""
+
+        def __init__(self, room, storey_label, taken_numbers, parent=None,
+                     same_default=None, include_default=None):
+            super().__init__(parent)
+            self.setWindowTitle("Room data")
+            self.setModal(True)
+            self.room, self.taken = room, taken_numbers
+            self.ok = False
+            self.advance = False
+
+            lay = QtWidgets.QVBoxLayout(self)
+            span = "" if room.top == room.base else f"  |  spans {room.top - room.base + 1} storeys"
+            lay.addWidget(QtWidgets.QLabel(
+                f"<b>Storey:</b> {storey_label}  |  <b>Area:</b> {room.polys[room.base].area:.1f} m²{span}"))
+
+            form = QtWidgets.QFormLayout()
+            self.num = QtWidgets.QLineEdit(room.number)
+            self.name = QtWidgets.QLineEdit(room.name)
+            self.same = QtWidgets.QCheckBox("Use room number as room name")
+            # Already edited rooms show their actual state; for all others the choice made
+            # in the previous dialog is carried over (if there was one).
+            keep_actual = room.edited or same_default is None
+            self.same.setChecked(room.name == room.number if keep_actual else same_default)
+            self.inc = QtWidgets.QCheckBox("Include this room in the export")
+            keep_actual = room.edited or include_default is None
+            self.inc.setChecked(room.include if keep_actual else include_default)
+            form.addRow("Room number:", self.num)
+            form.addRow("Room name:", self.name)
+            form.addRow("", self.same)
+            form.addRow("", self.inc)
+            lay.addLayout(form)
+
+            row = QtWidgets.QHBoxLayout()
+            b_ok = QtWidgets.QPushButton("OK")
+            b_ok.setDefault(True)
+            b_next = QtWidgets.QPushButton("OK and next room")
+            b_next.setShortcut("Ctrl+Return")
+            b_cancel = QtWidgets.QPushButton("Cancel")
+            row.addStretch(1)
+            row.addWidget(b_ok)
+            row.addWidget(b_next)
+            row.addWidget(b_cancel)
+            lay.addLayout(row)
+            b_ok.clicked.connect(lambda: self._commit(False))
+            b_next.clicked.connect(lambda: self._commit(True))
+            b_cancel.clicked.connect(self.reject)
+
+            self.num.textChanged.connect(self._sync)
+            self.same.toggled.connect(self._sync)
+            self._sync()
+            self.num.setFocus()
+            self.num.selectAll()
+
+        def _sync(self, *_):
+            self.name.setEnabled(not self.same.isChecked())
+            if self.same.isChecked():
+                self.name.setText(self.num.text())
+
+        def _commit(self, advance):
+            number = self.num.text().strip()
+            if not number:
+                QtWidgets.QMessageBox.warning(self, "Room data", "The room number must not be empty.")
+                return
+            if self.inc.isChecked() and number in self.taken:
+                answer = QtWidgets.QMessageBox.question(
+                    self, "Duplicate room number",
+                    f"The room number '{number}' is already used by another room. Use it anyway?")
+                if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                    return
+            self.ok = True
+            self.advance = advance
+            self.accept()
+
+        def values(self):
+            number = self.num.text().strip()
+            name = number if self.same.isChecked() else self.name.text().strip()
+            return number, name, self.inc.isChecked()
+
+    class RoomEditor(QtWidgets.QDialog):
+        """Floor plan per storey + room table + input dialog for room number and name."""
+
+        def __init__(self, analysis, params, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("Room editor")
+            self.resize(1280, 820)
+            self.a = analysis
+            self.params = params
+            self.rooms = {r.uid: r for r in analysis.rooms}
+            self.k = 0
+            self.sel = None
+            self.items, self.labels, self.row_of = {}, {}, {}
+            self.dirty = False
+            self.wants_export = False
+            self.export_dst = None
+            self.session_path = None
+            self.pref_same = None        # last state of "use room number as room name"
+            self.pref_include = None     # last state of "include in export"
+            self._first_show = True
+
+            lay = QtWidgets.QVBoxLayout(self)
+
+            top = QtWidgets.QHBoxLayout()
+            top.addWidget(QtWidgets.QLabel("Storey:"))
+            self.combo = QtWidgets.QComboBox()
+            top.addWidget(self.combo, 1)
+            self.chk_labels = QtWidgets.QCheckBox("Show labels")
+            self.chk_labels.setChecked(True)
+            self.chk_labels.toggled.connect(self._toggle_labels)
+            b_fit = QtWidgets.QPushButton("Fit view")
+            b_fit.clicked.connect(self.fit)
+            top.addWidget(self.chk_labels)
+            top.addWidget(b_fit)
+            lay.addLayout(top)
+
+            self.scene = QtWidgets.QGraphicsScene(self)
+            self.view = PlanView(self.scene)
+
+            right = QtWidgets.QWidget()
+            rl = QtWidgets.QVBoxLayout(right)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.addWidget(QtWidgets.QLabel("Rooms on this storey (double-click to edit):"))
+            self.table = QtWidgets.QTableWidget(0, 4)
+            self.table.setHorizontalHeaderLabels(["Number", "Name", "m²", "Done"])
+            self.table.verticalHeader().setVisible(False)
+            self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+            self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+            self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            self.table.itemSelectionChanged.connect(self._on_table_selection)
+            self.table.cellDoubleClicked.connect(self._on_table_double_click)
+            rl.addWidget(self.table, 1)
+            legend = QtWidgets.QLabel(
+                "Blue = not yet edited, green = edited, gray dashed = excluded, "
+                "hatched = room continues from a lower storey, red number = duplicate.")
+            legend.setWordWrap(True)
+            rl.addWidget(legend)
+
+            split = QtWidgets.QSplitter(Qt.Orientation.Horizontal)
+            split.addWidget(self.view)
+            split.addWidget(right)
+            split.setStretchFactor(0, 4)
+            split.setStretchFactor(1, 1)
+            split.setSizes([920, 340])
+            lay.addWidget(split, 1)
+
+            hint = QtWidgets.QLabel("Click = select  |  Double-click = edit room data  |  "
+                                    "Mouse wheel = zoom  |  Right/middle mouse button drag = pan")
+            lay.addWidget(hint)
+
+            bottom = QtWidgets.QHBoxLayout()
+            self.status = QtWidgets.QLabel("")
+            b_save = QtWidgets.QPushButton("Save session ...")
+            b_save.clicked.connect(self.save_session)
+            b_export = QtWidgets.QPushButton("Export IFC ...")
+            b_export.clicked.connect(self.export)
+            b_close = QtWidgets.QPushButton("Close")
+            b_close.clicked.connect(self.reject)
+            bottom.addWidget(self.status, 1)
+            bottom.addWidget(b_save)
+            bottom.addWidget(b_export)
+            bottom.addWidget(b_close)
+            lay.addLayout(bottom)
+
+            for k in range(len(self.a.storeys)):
+                self.combo.addItem(self._combo_text(k))
+            first = next((r.base for r in sorted(self.a.rooms, key=lambda r: r.base)), 0)
+            self.combo.setCurrentIndex(first)
+            self.combo.currentIndexChanged.connect(self.show_storey)
+            self.show_storey(first)
+
+        # ---------- helpers
+        def _combo_text(self, k):
+            st = self.a.storeys[k]
+            own = [r for r in self.a.rooms if r.base == k]
+            done = sum(1 for r in own if r.edited)
+            return f"{st.name} ({st.elev:+.2f} m) - {done}/{len(own)} edited"
+
+        def _update_combo_texts(self):
+            self.combo.blockSignals(True)
+            for k in range(len(self.a.storeys)):
+                self.combo.setItemText(k, self._combo_text(k))
+            self.combo.blockSignals(False)
+
+        def rooms_on(self, k):
+            rs = [r for r in self.a.rooms if r.base <= k <= r.top and k in r.polys]
+            return sorted(rs, key=lambda r: natural_key(r.number))
+
+        def _label_text(self, r):
+            return r.number if (not r.name or r.name == r.number) else f"{r.number}\n{r.name}"
+
+        def _make_label(self, r, k):
+            lbl = QtWidgets.QGraphicsSimpleTextItem(self._label_text(r))
+            font = QtGui.QFont()
+            font.setPointSize(8)
+            font.setBold(True)
+            lbl.setFont(font)
+            lbl.setBrush(QtGui.QBrush(QtGui.QColor(20, 20, 20)))
+            lbl.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+            lbl.setAcceptedMouseButtons(Qt.MouseButton.NoButton)   # clicks go to the room below
+            p = r.polys[k].representative_point()
+            lbl.setPos(p.x, -p.y)
+            br = lbl.boundingRect()
+            lbl.setTransform(QtGui.QTransform.fromTranslate(-br.width() / 2, -br.height() / 2))
+            lbl.setZValue(10)
+            lbl.setVisible(self.chk_labels.isChecked())
+            return lbl
+
+        def _toggle_labels(self, on):
+            for lbl in self.labels.values():
+                lbl.setVisible(on)
+
+        # ---------- plan
+        def show_storey(self, k):
+            if k < 0:
+                return
+            self.k = k
+            self.scene.clear()
+            self.items.clear()
+            self.labels.clear()
+            st = self.a.storeys[k]
+            if st.barrier is not None and not st.barrier.is_empty:
+                walls = self.scene.addPath(geom_to_path(st.barrier), QtGui.QPen(Qt.PenStyle.NoPen),
+                                           QtGui.QBrush(QtGui.QColor(70, 70, 70)))
+                walls.setZValue(0)
+                walls.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            for r in self.rooms_on(k):
+                item = RoomItem(self, r, k)
+                self.scene.addItem(item)
+                self.items[r.uid] = item
+                lbl = self._make_label(r, k)
+                self.scene.addItem(lbl)
+                self.labels[r.uid] = lbl
+            rect = self.scene.itemsBoundingRect()
+            self.scene.setSceneRect(rect.adjusted(-rect.width(), -rect.height(), rect.width(), rect.height()))
+            if self.sel not in self.items:
+                self.sel = None
+            elif self.sel is not None:
+                self.items[self.sel].set_selected(True)
+            self.refresh_table()
+            self.fit()
+
+        def fit(self):
+            rect = self.scene.itemsBoundingRect()
+            if not rect.isNull():
+                self.view.fitInView(rect.adjusted(-1, -1, 1, 1), Qt.AspectRatioMode.KeepAspectRatio)
+
+        def showEvent(self, e):
+            super().showEvent(e)
+            if self._first_show:
+                self._first_show = False
+                QtCore.QTimer.singleShot(0, self.fit)
+
+        # ---------- table
+        def refresh_table(self):
+            rooms = self.rooms_on(self.k)
+            counts = Counter(r.number for r in self.a.rooms if r.include)
+            t = self.table
+            t.blockSignals(True)
+            t.setRowCount(len(rooms))
+            self.row_of = {}
+            for i, r in enumerate(rooms):
+                self.row_of[r.uid] = i
+                cells = [r.number, r.name, f"{r.polys[self.k].area:.1f}", "yes" if r.edited else ""]
+                for c, text in enumerate(cells):
+                    it = QtWidgets.QTableWidgetItem(text)
+                    if c == 0:
+                        it.setData(Qt.ItemDataRole.UserRole, r.uid)
+                    if not r.include:
+                        it.setForeground(QtGui.QBrush(QtGui.QColor(140, 140, 140)))
+                    elif c == 0 and counts[r.number] > 1:
+                        it.setForeground(QtGui.QBrush(QtGui.QColor(200, 0, 0)))
+                    t.setItem(i, c, it)
+            if self.sel in self.row_of:
+                t.selectRow(self.row_of[self.sel])
+            t.blockSignals(False)
+            t.resizeColumnToContents(0)
+
+        def _on_table_selection(self):
+            rows = self.table.selectionModel().selectedRows()
+            if rows:
+                uid = self.table.item(rows[0].row(), 0).data(Qt.ItemDataRole.UserRole)
+                self.select_room(uid, center=True, sync_table=False)
+
+        def _on_table_double_click(self, row, _col):
+            uid = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+            self.edit_room(uid)
+
+        # ---------- selection / editing
+        def select_room(self, uid, center=False, sync_table=True):
+            old = self.sel
+            self.sel = uid
+            if old in self.items:
+                self.items[old].set_selected(False)
+            item = self.items.get(uid)
+            if item is not None:
+                item.set_selected(True)
+                if center:
+                    self.view.centerOn(item)
+            if sync_table and uid in self.row_of:
+                self.table.blockSignals(True)
+                self.table.selectRow(self.row_of[uid])
+                self.table.blockSignals(False)
+
+        def _next_uid(self, uid):
+            order = [r.uid for r in self.rooms_on(self.k)]
+            if uid in order and order.index(uid) + 1 < len(order):
+                return order[order.index(uid) + 1]
+            return None
+
+        def edit_room(self, uid):
+            while True:
+                room = self.rooms[uid]
+                self.select_room(uid, center=True)
+                taken = {r.number for r in self.a.rooms if r.uid != uid and r.include}
+                dlg = RoomDialog(room, self.a.storeys[room.base].name, taken, self,
+                                 same_default=self.pref_same, include_default=self.pref_include)
+                dlg.exec()
+                if not dlg.ok:
+                    return
+                self.pref_same = dlg.same.isChecked()
+                self.pref_include = dlg.inc.isChecked()
+                room.number, room.name, room.include = dlg.values()
+                room.edited = True
+                self.dirty = True
+                self._refresh_after_edit(uid)
+                if not dlg.advance:
+                    return
+                uid = self._next_uid(uid)
+                if uid is None:
+                    return
+
+        def _refresh_after_edit(self, uid):
+            room = self.rooms[uid]
+            if uid in self.items:
+                self.items[uid].restyle()
+                lbl = self.labels[uid]
+                lbl.setText(self._label_text(room))
+                br = lbl.boundingRect()
+                lbl.setTransform(QtGui.QTransform.fromTranslate(-br.width() / 2, -br.height() / 2))
+            self.refresh_table()
+            self._update_combo_texts()
+
+        # ---------- session / export / close
+        def save_session(self):
+            default = self.session_path or os.path.splitext(self.a.src)[0] + "_rooms.json"
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save session", default,
+                                                            "Session (*.json)")
+            if not path:
+                return False
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(session_to_dict(self.a, self.params), f)
+            except Exception as ex:
+                QtWidgets.QMessageBox.critical(self, "Save session", str(ex))
+                return False
+            self.session_path = path
+            self.dirty = False
+            self.status.setText(f"Session saved: {path}")
+            return True
+
+        def export(self):
+            if not os.path.isfile(self.a.src):
+                path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                    self, "Locate the source IFC file", "", "IFC (*.ifc);;All files (*)")
+                if not path:
+                    return
+                self.a.src = path
+            included = [r for r in self.a.rooms if r.include]
+            dups = [n for n, c in Counter(r.number for r in included).items() if c > 1]
+            if dups:
+                answer = QtWidgets.QMessageBox.question(
+                    self, "Duplicate room numbers",
+                    f"{len(dups)} room number(s) are used more than once. Export anyway?")
+                if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                    return
+            default = self.params.get("dst") or os.path.splitext(self.a.src)[0] + "_spaces.ifc"
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export IFC", default, "IFC (*.ifc)")
+            if not path:
+                return
+            if os.path.abspath(path) == os.path.abspath(self.a.src):
+                QtWidgets.QMessageBox.warning(self, "Export", "The output must not be the input file.")
+                return
+            self.export_dst = path
+            self.wants_export = True
+            self.accept()
+
+        def reject(self):
+            if self.dirty:
+                B = QtWidgets.QMessageBox.StandardButton
+                answer = QtWidgets.QMessageBox.question(
+                    self, "Close editor", "Save the session before closing?",
+                    B.Save | B.Discard | B.Cancel)
+                if answer == B.Cancel:
+                    return
+                if answer == B.Save and not self.save_session():
+                    return
+            super().reject()
+
+    return RoomEditor
+
+
+# --------------------------------------------------------------------------
+# GUI: main window (PySide6)
 # --------------------------------------------------------------------------
 def run_gui():
     import multiprocessing as mp
-    from PySide6 import QtCore, QtWidgets
+    from PySide6 import QtCore, QtGui, QtWidgets
 
     ctx = mp.get_context("spawn")
+    RoomEditor = _make_editor_class(QtCore, QtGui, QtWidgets)
 
     class MainWindow(QtWidgets.QMainWindow):
         def __init__(self):
             super().__init__()
             self.setWindowTitle("IFC Space Generator")
-            self.resize(860, 680)
+            self.resize(900, 720)
             self.setAcceptDrops(True)
             self._proc = None
             self._queue = None
             self._t0 = 0.0
             self._finished = True
+            self._mode = ""
+            self.analysis = None
+            self.params_dict = {}
 
             central = QtWidgets.QWidget()
             self.setCentralWidget(central)
@@ -618,26 +1306,34 @@ def run_gui():
             self.deduct.setRange(0.0, 1.0); self.deduct.setSingleStep(0.05)
             self.deduct.setSuffix(" m"); self.deduct.setValue(d.ceiling_deduction)
             self.merge = QtWidgets.QCheckBox("Join multi-storey rooms (stairwells) into one space")
-            self.merge.setChecked(False)
+            self.merge.setChecked(True)
             of.addRow("Cut height above storey level:", self.cut)
             of.addRow("Minimum room area:", self.min_area)
             of.addRow("Close gaps up to:", self.gap)
-            of.addRow("Numbering scheme:", self.fmt)
+            of.addRow("Numbering scheme (initial numbers):", self.fmt)
             of.addRow("Number of the lowest storey:", self.first)
             of.addRow("Subtract slab thickness from room height:", self.deduct)
             of.addRow("", self.merge)
             lay.addWidget(opts)
 
             row = QtWidgets.QHBoxLayout()
-            self.btn_start = QtWidgets.QPushButton("Generate spaces")
-            self.btn_start.setMinimumHeight(34)
-            self.btn_start.clicked.connect(self.start)
+            self.btn_gen = QtWidgets.QPushButton("Generate spaces (automatic)")
+            self.btn_gen.setToolTip("Analysis and export in one go, rooms are numbered automatically.")
+            self.btn_analyze = QtWidgets.QPushButton("Analyze and edit rooms ...")
+            self.btn_analyze.setToolTip("Detect rooms, then edit room numbers and names per storey.")
+            self.btn_load = QtWidgets.QPushButton("Load session ...")
+            self.btn_reopen = QtWidgets.QPushButton("Reopen editor")
+            self.btn_reopen.setEnabled(False)
             self.btn_cancel = QtWidgets.QPushButton("Cancel")
-            self.btn_cancel.setMinimumHeight(34)
             self.btn_cancel.setEnabled(False)
+            for b in (self.btn_gen, self.btn_analyze, self.btn_load, self.btn_reopen, self.btn_cancel):
+                b.setMinimumHeight(34)
+                row.addWidget(b)
+            self.btn_gen.clicked.connect(self.start_generate)
+            self.btn_analyze.clicked.connect(self.start_analyze)
+            self.btn_load.clicked.connect(self.load_session)
+            self.btn_reopen.clicked.connect(self.open_editor)
             self.btn_cancel.clicked.connect(self.cancel)
-            row.addWidget(self.btn_start, 3)
-            row.addWidget(self.btn_cancel, 1)
             lay.addLayout(row)
 
             self.log = QtWidgets.QPlainTextEdit()
@@ -686,28 +1382,81 @@ def run_gui():
                     self._set_input(u.toLocalFile())
                     break
 
-        # ---------- Workflow
-        def start(self):
+        # ---------- Parameters
+        def _collect_params(self, need_dst):
             src = self.in_edit.text().strip()
             if not os.path.isfile(src):
                 QtWidgets.QMessageBox.warning(self, "Input", "Please choose an existing IFC file.")
-                return
+                return None
             dst = self.out_edit.text().strip() or os.path.splitext(src)[0] + "_spaces.ifc"
-            if os.path.abspath(dst) == os.path.abspath(src):
+            if need_dst and os.path.abspath(dst) == os.path.abspath(src):
                 QtWidgets.QMessageBox.warning(self, "Output", "The output must not be the input file.")
-                return
+                return None
             try:
                 self.fmt.text().format(g=1, s="X", n=1)
             except Exception as ex:
                 QtWidgets.QMessageBox.warning(self, "Numbering scheme", f"Invalid: {ex}")
+                return None
+            return Params(src=src, dst=dst, cut_height=self.cut.value(), min_area=self.min_area.value(),
+                          gap_mm=float(self.gap.value()), number_format=self.fmt.text(),
+                          first_storey_no=self.first.value(), merge_multistorey=self.merge.isChecked(),
+                          ceiling_deduction=self.deduct.value())
+
+        # ---------- Workflow
+        def start_generate(self):
+            p = self._collect_params(need_dst=True)
+            if p:
+                self.log.clear()
+                self._run("generate", p, None)
+
+        def start_analyze(self):
+            p = self._collect_params(need_dst=False)
+            if p:
+                if self.analysis is not None and any(r.edited for r in self.analysis.rooms):
+                    answer = QtWidgets.QMessageBox.question(
+                        self, "Analyze again",
+                        "A new analysis replaces the rooms currently in memory, including your edits "
+                        "(save a session first if you want to keep them). Continue?")
+                    if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                        return
+                self.log.clear()
+                self.params_dict = asdict(p)
+                self._run("analyze", p, None)
+
+        def load_session(self):
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Load session", os.path.dirname(self.in_edit.text()), "Session (*.json)")
+            if not path:
                 return
-            params = Params(src=src, dst=dst, cut_height=self.cut.value(), min_area=self.min_area.value(),
-                            gap_mm=float(self.gap.value()), number_format=self.fmt.text(),
-                            first_storey_no=self.first.value(), merge_multistorey=self.merge.isChecked(),
-                            ceiling_deduction=self.deduct.value())
-            self.log.clear()
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    self.analysis, self.params_dict = session_from_dict(json.load(f))
+            except Exception as ex:
+                QtWidgets.QMessageBox.critical(self, "Load session", f"Could not load the session:\n{ex}")
+                return
+            if self.analysis.src:
+                self.in_edit.setText(self.analysis.src)
+            if self.params_dict.get("dst"):
+                self.out_edit.setText(self.params_dict["dst"])
+            self.log.appendPlainText(f"Session loaded: {path} ({len(self.analysis.rooms)} rooms)")
+            self.btn_reopen.setEnabled(True)
+            self.open_editor()
+
+        def open_editor(self):
+            if self.analysis is None:
+                return
+            ed = RoomEditor(self.analysis, self.params_dict, self)
+            ed.exec()
+            if ed.wants_export:
+                self.params_dict["dst"] = ed.export_dst
+                self.out_edit.setText(ed.export_dst)
+                self._run("export", Params(src=self.analysis.src, dst=ed.export_dst), self.analysis)
+
+        def _run(self, mode, params, analysis):
+            self._mode = mode
             self._queue = ctx.Queue()
-            self._proc = ctx.Process(target=_worker_main, args=(params, self._queue), daemon=True)
+            self._proc = ctx.Process(target=_worker_main, args=(mode, params, analysis, self._queue),
+                                     daemon=True)
             self._proc.start()
             self._finished = False
             self._t0 = time.time()
@@ -720,7 +1469,9 @@ def run_gui():
             self._finish("Cancelled.")
 
         def _set_running(self, running):
-            self.btn_start.setEnabled(not running)
+            for b in (self.btn_gen, self.btn_analyze, self.btn_load):
+                b.setEnabled(not running)
+            self.btn_reopen.setEnabled((not running) and self.analysis is not None)
             self.btn_cancel.setEnabled(running)
 
         def _finish(self, message):
@@ -729,6 +1480,19 @@ def run_gui():
             self._set_running(False)
             self.bar.setRange(0, 1000)
             self.statusBar().showMessage(message)
+
+        def _on_done(self, payload):
+            if self._mode == "analyze":
+                self.analysis = payload
+                self.btn_reopen.setEnabled(True)
+                self.log.appendPlainText(f"{len(payload.rooms)} rooms detected - opening the room editor ...")
+                self.open_editor()
+            else:
+                per = "\n".join(f"  {k}: {v}" for k, v in payload["per_storey"].items())
+                QtWidgets.QMessageBox.information(
+                    self, "Done",
+                    f"Created {payload['spaces']} IfcSpaces "
+                    f"({payload['multi']} multi-storey).\n\n{per}\n\n{payload['dst']}")
 
         def _drain(self):
             try:
@@ -747,11 +1511,8 @@ def run_gui():
                     elif kind == "done":
                         self._finish("Done.")
                         self.bar.setValue(1000)
-                        per = "\n".join(f"  {k}: {v}" for k, v in payload["per_storey"].items())
-                        QtWidgets.QMessageBox.information(
-                            self, "Done",
-                            f"Created {payload['spaces']} IfcSpaces "
-                            f"({payload['multi']} multi-storey).\n\n{per}\n\n{payload['dst']}")
+                        # defer so that no dialog opens while this loop still reads the queue
+                        QtCore.QTimer.singleShot(0, lambda p=payload: self._on_done(p))
                     elif kind == "error":
                         self._finish("Error.")
                         self.log.appendPlainText(payload)
